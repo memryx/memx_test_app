@@ -17,15 +17,21 @@
 namespace fs = std::filesystem;
 
 std::atomic_bool runflag;  // Atomic flag to control run state
-bool is_show_global = false;  // Global flag to indicate if any stream should show display
-int num_streams_global = 0;  // Total number of configured streams
+bool is_show_global = true;  // Global flag to indicate if any stream should show display - ALWAYS TRUE
+int num_streams_global = 2;  // Total number of configured streams - ALWAYS 2
 std::mutex display_mutex;  // Protect shared OpenCV display state
-std::vector<cv::Mat> latest_display_frames;  // Latest rendered frame from each stream
-bool is_fullscreen = false;  // Global flag to track fullscreen state
 
-// Yolo26 application specific parameters
-fs::path model_path = "../../assets/models/YOLO26_nano_640_640_3_onnx.dfp";  // Default model path
-std::string video_str = "vid:../../assets/video/sample.mp4";
+// Quadrant window configuration
+int screen_width = 0;
+int screen_height = 0;
+int quadrant_width = 0;
+int quadrant_height = 0;
+cv::Mat logo_image;
+cv::Mat modules_image;
+
+// Yolo26 application specific parameters - HARDCODED FOR SILLY GOOSE MODE
+fs::path model_path = "YOLO26_nano_640_640_3_onnx.dfp";  // Hardcoded DFP path
+std::string video_str = "cam:0,cam:2";  // Hardcoded dual camera setup
 
 #define FPS_LOG_INTERVAL 30  // print out FPS every X frames
 #define FRAME_QUEUE_MAX_LENGTH     5
@@ -33,16 +39,6 @@ std::string video_str = "vid:../../assets/video/sample.mp4";
 // Signal handler to gracefully stop the program on SIGINT (Ctrl+C)
 void signal_handler(int p_signal) {
     runflag.store(false);  // Stop the program
-}
-
-// Function to display usage information
-void print_usage(const std::string& program_name) {
-    std::cout << "Usage: " << program_name
-              << " [-d <dfp_path>] [--show] [--video_paths \"cam:0,vid:video_path\"]\n"
-              << "Options:\n"
-              << "  -d, --dfp_path        (Optional) Path to the DFP. Default: "<< model_path<<"\n"
-              << "  --video_paths         (Optional) Video paths in the format \"cam:0,vid:video_path,vid:video2_path\". Default: cam:0\n"
-              << "  --show                (Optional) Display the inference result. Default: false\n";
 }
 
 // Function to configure camera settings (resolution and FPS)
@@ -170,74 +166,26 @@ class YoloApp {
             // Display the updated image using OpenCV
             if (is_show) {
                 try {
-                    // Add FPS/stream text to the display
+                    // Add FPS/stream text to the display (truncated to integer)
                     std::string fps_text = "Stream " + std::to_string(stream_idx) +
-                                           " FPS: " + std::to_string(fps_number);
+                                           " FPS: " + std::to_string(static_cast<int>(fps_number));
                     cv::putText(display_image, fps_text, cv::Point(10, 30),
                                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
 
                     std::lock_guard<std::mutex> dlock(display_mutex);
 
-                    if (num_streams_global == 2) {
-                        // Store the latest rendered frame for this stream. Clone because
-                        // display_image is owned by this callback invocation.
-                        if (stream_idx >= 0 && stream_idx < static_cast<int>(latest_display_frames.size())) {
-                            latest_display_frames[stream_idx] = display_image.clone();
-                        }
+                    // Display each stream in its own quadrant window
+                    std::string window_name = (stream_idx == 0) ? "Stream 0 - Camera 0" : "Stream 1 - Camera 2";
+                    
+                    // Resize to fit quadrant and display
+                    cv::Mat resized_display;
+                    cv::resize(display_image, resized_display, cv::Size(quadrant_width, quadrant_height));
+                    cv::imshow(window_name, resized_display);
 
-                        // Show only after both streams have produced at least one frame.
-                        if (!latest_display_frames[0].empty() && !latest_display_frames[1].empty()) {
-                            cv::Mat top = latest_display_frames[0];
-                            cv::Mat bottom = latest_display_frames[1];
-
-                            // vconcat requires equal widths and compatible types. Resize to
-                            // a common width while preserving each stream's aspect ratio.
-                            int target_width = std::max(top.cols, bottom.cols);
-                            if (top.cols != target_width) {
-                                int target_height = static_cast<int>(
-                                    top.rows * (static_cast<double>(target_width) / top.cols));
-                                cv::resize(top, top, cv::Size(target_width, target_height));
-                            }
-                            if (bottom.cols != target_width) {
-                                int target_height = static_cast<int>(
-                                    bottom.rows * (static_cast<double>(target_width) / bottom.cols));
-                                cv::resize(bottom, bottom, cv::Size(target_width, target_height));
-                            }
-
-                            cv::Mat stacked_display;
-                            cv::vconcat(top, bottom, stacked_display);
-                            cv::imshow("YOLO26 Detection", stacked_display);
-                        }
-                    } else {
-                        // Preserve the original behavior for one stream or more than two
-                        // streams: one window per stream.
-                        std::string window_name = "YOLO26 Detection - Stream " + std::to_string(stream_idx);
-                        cv::imshow(window_name, display_image);
-                    }
-
-                    // Handle keyboard input for fullscreen toggle
+                    // Handle keyboard input
                     int key = cv::waitKey(1);
-                    if (key == 'f' || key == 'F') {
-                        // Toggle fullscreen
-                        is_fullscreen = !is_fullscreen;
-                        std::string target_window = (num_streams_global == 2) ? 
-                            "YOLO26 Detection" : 
-                            "YOLO26 Detection - Stream " + std::to_string(stream_idx);
-                        
-                        if (is_fullscreen) {
-                            cv::setWindowProperty(target_window, cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
-                        } else {
-                            cv::setWindowProperty(target_window, cv::WND_PROP_FULLSCREEN, cv::WINDOW_NORMAL);
-                        }
-                    } else if (key == 27) {  // ESC key
-                        // Exit fullscreen if in fullscreen mode
-                        if (is_fullscreen) {
-                            is_fullscreen = false;
-                            std::string target_window = (num_streams_global == 2) ? 
-                                "YOLO26 Detection" : 
-                                "YOLO26 Detection - Stream " + std::to_string(stream_idx);
-                            cv::setWindowProperty(target_window, cv::WND_PROP_FULLSCREEN, cv::WINDOW_NORMAL);
-                        }
+                    if (key == 27 || key == 'q' || key == 'Q') {  // ESC or Q key to quit
+                        runflag.store(false);
                     }
                 } catch (const cv::Exception& e) {
                     std::cerr << "OpenCV display error (continuing): " << e.what() << std::endl;
@@ -342,76 +290,104 @@ class YoloApp {
 };
 
 int main(int argc, char* argv[]) {
-    std::cout << "YOLO26 Application Starting..." << std::endl;
-    std::cout << "Arguments: " << argc << std::endl;
+    std::cout << "YOLO26 Silly Goose Quadrant Mode Starting..." << std::endl;
     
     try {
         signal(SIGINT, signal_handler);  // Set up signal handler
-        std::vector<std::string> video_src_list;
-
-    // Iterate through the arguments
-    for (int i = 1; i < argc; i++) {
-
-        std::string arg = argv[i];
-        std::cout << "Processing argument: " << arg << std::endl;
-
-        // Handle -d or --dfp_path
-        if (arg == "-d" || arg == "--dfp_path") {
-            if (i + 1 < argc && argv[i + 1][0] != '-') {  // Ensure there's a next argument and it is not another option
-                model_path = argv[++i];
-            } else {
-                std::cerr << "Error: Missing value for " << arg << " option.\n";
-                print_usage(argv[0]);
-                return 1;
-            }
-        }
-        // Handle --video_paths
-        else if (arg == "--video_paths") {
-            if (i + 1 < argc && argv[i + 1][0] != '-') {  // Ensure there's a next argument and it is not another option
-                video_str = argv[++i];
-                 size_t pos = 0;
-                std::string token;
-                std::string delimiter = ",";
-                while ((pos = video_str.find(delimiter)) != std::string::npos) {
-                    token = video_str.substr(0, pos);
-                    video_src_list.push_back(token);
-                    video_str.erase(0, pos + delimiter.length());
+        
+        // HARDCODED CONFIGURATION - SILLY GOOSE MODE!
+        std::vector<std::string> video_src_list = {"cam:0", "cam:2"};
+        int num_streams = 2;
+        num_streams_global = num_streams;
+        
+        // Hardcoded screen resolution for embedded platform
+        // To change: edit these two lines
+        screen_width = 1920;
+        screen_height = 1080;
+        
+        // Calculate quadrant dimensions
+        quadrant_width = screen_width / 2;   // Should be 960
+        quadrant_height = screen_height / 2; // Should be 540
+        
+        std::cout << "Screen Resolution: " << screen_width << "x" << screen_height << std::endl;
+        std::cout << "Quadrant Size: " << quadrant_width << "x" << quadrant_height << std::endl;
+        std::cout << "  Width: " << quadrant_width << " (should be WIDER)" << std::endl;
+        std::cout << "  Height: " << quadrant_height << " (should be SHORTER)" << std::endl;
+        
+        // Get current working directory for debugging
+        fs::path cwd = fs::current_path();
+        std::cout << "Current working directory: " << cwd << std::endl;
+        
+        // Try to find images in current directory or executable directory
+        fs::path exe_path = fs::path(argv[0]).parent_path();
+        std::cout << "Executable path: " << exe_path << std::endl;
+        
+        // Try multiple locations for the images
+        std::vector<fs::path> search_paths = {
+            cwd / "combined_logos.png",
+            exe_path / "combined_logos.png",
+            cwd / ".." / "combined_logos.png"
+        };
+        
+        // Load logo image
+        logo_image = cv::Mat();
+        for (const auto& path : search_paths) {
+            std::cout << "Trying to load logo from: " << path << std::endl;
+            if (fs::exists(path)) {
+                logo_image = cv::imread(path.string());
+                if (!logo_image.empty()) {
+                    std::cout << "Successfully loaded logo from: " << path << std::endl;
+                    break;
                 }
-                video_src_list.push_back(video_str);
-            } else {
-                std::cerr << "Error: Missing value for " << arg << " option.\n";
-                print_usage(argv[0]);
-                return 1;
             }
         }
-        else if (arg == "--show") {
-            is_show_global = true;
+        
+        if (logo_image.empty()) {
+            std::cerr << "Warning: Could not load combined_logos.png from any location, using placeholder" << std::endl;
+            logo_image = cv::Mat(quadrant_height, quadrant_width, CV_8UC3, cv::Scalar(50, 50, 50));
+            cv::putText(logo_image, "combined_logos.png", cv::Point(50, quadrant_height/2),
+                       cv::FONT_HERSHEY_SIMPLEX, 2.0, cv::Scalar(255, 255, 255), 3);
+        } else {
+            cv::resize(logo_image, logo_image, cv::Size(quadrant_width, quadrant_height));
         }
-        // Handle unknown options
-        else {
-            std::cerr << "Error: Unknown option " << arg << "\n";
-            print_usage(argv[0]);
-            return 1;
+        
+        // Try multiple locations for modules image
+        std::vector<fs::path> search_paths_modules = {
+            cwd / "combined_modules.png",
+            exe_path / "combined_modules.png",
+            cwd / ".." / "combined_modules.png"
+        };
+        
+        // Load modules image
+        modules_image = cv::Mat();
+        for (const auto& path : search_paths_modules) {
+            std::cout << "Trying to load modules from: " << path << std::endl;
+            if (fs::exists(path)) {
+                modules_image = cv::imread(path.string());
+                if (!modules_image.empty()) {
+                    std::cout << "Successfully loaded modules from: " << path << std::endl;
+                    break;
+                }
+            }
         }
-    }
+        
+        if (modules_image.empty()) {
+            std::cerr << "Warning: Could not load combined_modules.png from any location, using placeholder" << std::endl;
+            modules_image = cv::Mat(quadrant_height, quadrant_width, CV_8UC3, cv::Scalar(70, 70, 70));
+            cv::putText(modules_image, "combined_modules.png", cv::Point(50, quadrant_height/2),
+                       cv::FONT_HERSHEY_SIMPLEX, 2.0, cv::Scalar(255, 255, 255), 3);
+        } else {
+            cv::resize(modules_image, modules_image, cv::Size(quadrant_width, quadrant_height));
+        }
 
-    // if video_paths arg isn't passed - use default video string.
-    int num_streams = video_src_list.size();
-    if(num_streams == 0){
-        video_src_list.push_back(video_str);
-        num_streams = 1;
-    }
-    num_streams_global = num_streams;
-    latest_display_frames.assign(num_streams_global, cv::Mat());
-
-    std::cout << "\n=== Configuration ===" << std::endl;
-    std::cout << "Model path: " << model_path << std::endl;
-    std::cout << "Number of streams: " << num_streams << std::endl;
-    std::cout << "Display enabled: " << (is_show_global ? "yes" : "no") << std::endl;
-    for (int i = 0; i < num_streams; ++i) {
-        std::cout << "  Stream " << i << ": " << video_src_list[i] << std::endl;
-    }
-    std::cout << "=====================\n" << std::endl;
+        std::cout << "\n=== SILLY GOOSE QUADRANT CONFIGURATION ===" << std::endl;
+        std::cout << "Model path: " << model_path << " (HARDCODED)" << std::endl;
+        std::cout << "Number of streams: " << num_streams << " (HARDCODED)" << std::endl;
+        std::cout << "Display enabled: YES (ALWAYS)" << std::endl;
+        for (int i = 0; i < num_streams; ++i) {
+            std::cout << "  Stream " << i << ": " << video_src_list[i] << std::endl;
+        }
+        std::cout << "==========================================\n" << std::endl;
 
     std::cout << "Initializing MemryX Accelerator..." << std::endl;
     
@@ -443,19 +419,53 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Create OpenCV windows with resizable/fullscreen capability
-    if (is_show_global) {
-        if (num_streams == 2) {
-            cv::namedWindow("YOLO26 Detection", cv::WINDOW_NORMAL);
-            std::cout << "Created resizable window 'YOLO26 Detection' (press 'f' for fullscreen, ESC to exit fullscreen)" << std::endl;
-        } else {
-            for (int i = 0; i < num_streams; ++i) {
-                std::string window_name = "YOLO26 Detection - Stream " + std::to_string(i);
-                cv::namedWindow(window_name, cv::WINDOW_NORMAL);
-            }
-            std::cout << "Created resizable window(s) (press 'f' for fullscreen, ESC to exit fullscreen)" << std::endl;
-        }
-    }
+    // Create OpenCV windows positioned at each quadrant
+    std::cout << "Creating quadrant windows..." << std::endl;
+    
+    // Create windows with AUTOSIZE (no manual resizing, minimal decorations)
+    cv::namedWindow("Stream 0 - Camera 0", cv::WINDOW_AUTOSIZE);
+    cv::namedWindow("Stream 1 - Camera 2", cv::WINDOW_AUTOSIZE);
+    cv::namedWindow("Logos", cv::WINDOW_AUTOSIZE);
+    cv::namedWindow("Modules", cv::WINDOW_AUTOSIZE);
+    
+    // Try to remove window decorations (may not work on all window managers)
+    cv::setWindowProperty("Stream 0 - Camera 0", cv::WND_PROP_TOPMOST, 1);
+    cv::setWindowProperty("Stream 1 - Camera 2", cv::WND_PROP_TOPMOST, 1);
+    cv::setWindowProperty("Logos", cv::WND_PROP_TOPMOST, 1);
+    cv::setWindowProperty("Modules", cv::WND_PROP_TOPMOST, 1);
+    
+    // Note: With AUTOSIZE, windows will size to match image content automatically
+    // No need to call cv::resizeWindow()
+    
+    // Wait a moment for window manager to process
+    cv::waitKey(50);
+    
+    // Position windows at each quadrant
+    // Top-left: Stream 0
+    cv::moveWindow("Stream 0 - Camera 0", 0, 0);
+    
+    // Top-right: Stream 1  
+    cv::moveWindow("Stream 1 - Camera 2", quadrant_width, 0);
+    
+    // Bottom-left: Logos
+    cv::moveWindow("Logos", 0, quadrant_height);
+    
+    // Bottom-right: Modules
+    cv::moveWindow("Modules", quadrant_width, quadrant_height);
+    
+    // Final wait to let window manager settle
+    cv::waitKey(50);
+    
+    std::cout << "Quadrant windows created and positioned!" << std::endl;
+    std::cout << "  Stream 0 at (0, 0) - size " << quadrant_width << "x" << quadrant_height << std::endl;
+    std::cout << "  Stream 1 at (" << quadrant_width << ", 0) - size " << quadrant_width << "x" << quadrant_height << std::endl;
+    std::cout << "  Logos at (0, " << quadrant_height << ") - size " << quadrant_width << "x" << quadrant_height << std::endl;
+    std::cout << "  Modules at (" << quadrant_width << ", " << quadrant_height << ") - size " << quadrant_width << "x" << quadrant_height << std::endl;
+    
+    // Display static images once - they'll stay visible until program exits
+    cv::imshow("Logos", logo_image);
+    cv::imshow("Modules", modules_image);
+    cv::waitKey(1);  // Process window events once
 
     std::cout << "Starting accelerator..." << std::endl;
     
@@ -466,13 +476,11 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Accelerator stopped." << std::endl;
     
-    // Cleanup OpenCV windows if display was enabled
-    if (is_show_global) {
-        try {
-            cv::destroyAllWindows();
-        } catch (...) {
-            // Ignore cleanup errors
-        }
+    // Cleanup OpenCV windows
+    try {
+        cv::destroyAllWindows();
+    } catch (...) {
+        // Ignore cleanup errors
     }
 
     // Print out final avg FPS
@@ -488,7 +496,7 @@ int main(int argc, char* argv[]) {
         delete apps[i];
     }
     
-    std::cout << "Application finished successfully!" << std::endl;
+    std::cout << "\n🦆 Silly Goose Quadrant Mode finished successfully! 🦆" << std::endl;
     return 0;
     
     } catch (const std::exception& e) {

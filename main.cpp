@@ -5,6 +5,12 @@
 #include <opencv2/imgproc.hpp>   /* cvtcolor */
 #include <opencv2/imgcodecs.hpp> /* imwrite */
 #include <chrono>
+#include <algorithm>
+#include <atomic>
+#include <deque>
+#include <filesystem>
+#include <mutex>
+#include <vector>
 #include "memx/accl/MxAccl.h"
 #include "yolo26.h"
 
@@ -12,6 +18,10 @@ namespace fs = std::filesystem;
 
 std::atomic_bool runflag;  // Atomic flag to control run state
 bool is_show_global = false;  // Global flag to indicate if any stream should show display
+int num_streams_global = 0;  // Total number of configured streams
+std::mutex display_mutex;  // Protect shared OpenCV display state
+std::vector<cv::Mat> latest_display_frames;  // Latest rendered frame from each stream
+bool is_fullscreen = false;  // Global flag to track fullscreen state
 
 // Yolo26 application specific parameters
 fs::path model_path = "../../assets/models/YOLO26_nano_640_640_3_onnx.dfp";  // Default model path
@@ -160,15 +170,75 @@ class YoloApp {
             // Display the updated image using OpenCV
             if (is_show) {
                 try {
-                    // Add FPS text to the display
-                    std::string fps_text = "FPS: " + std::to_string(fps_number);
-                    cv::putText(display_image, fps_text, cv::Point(10, 30), 
+                    // Add FPS/stream text to the display
+                    std::string fps_text = "Stream " + std::to_string(stream_idx) +
+                                           " FPS: " + std::to_string(fps_number);
+                    cv::putText(display_image, fps_text, cv::Point(10, 30),
                                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-                    
-                    // Create window name with stream index
-                    std::string window_name = "YOLO26 Detection - Stream " + std::to_string(stream_idx);
-                    cv::imshow(window_name, display_image);
-                    cv::waitKey(1);  // Allow OpenCV to process window events
+
+                    std::lock_guard<std::mutex> dlock(display_mutex);
+
+                    if (num_streams_global == 2) {
+                        // Store the latest rendered frame for this stream. Clone because
+                        // display_image is owned by this callback invocation.
+                        if (stream_idx >= 0 && stream_idx < static_cast<int>(latest_display_frames.size())) {
+                            latest_display_frames[stream_idx] = display_image.clone();
+                        }
+
+                        // Show only after both streams have produced at least one frame.
+                        if (!latest_display_frames[0].empty() && !latest_display_frames[1].empty()) {
+                            cv::Mat top = latest_display_frames[0];
+                            cv::Mat bottom = latest_display_frames[1];
+
+                            // vconcat requires equal widths and compatible types. Resize to
+                            // a common width while preserving each stream's aspect ratio.
+                            int target_width = std::max(top.cols, bottom.cols);
+                            if (top.cols != target_width) {
+                                int target_height = static_cast<int>(
+                                    top.rows * (static_cast<double>(target_width) / top.cols));
+                                cv::resize(top, top, cv::Size(target_width, target_height));
+                            }
+                            if (bottom.cols != target_width) {
+                                int target_height = static_cast<int>(
+                                    bottom.rows * (static_cast<double>(target_width) / bottom.cols));
+                                cv::resize(bottom, bottom, cv::Size(target_width, target_height));
+                            }
+
+                            cv::Mat stacked_display;
+                            cv::vconcat(top, bottom, stacked_display);
+                            cv::imshow("YOLO26 Detection", stacked_display);
+                        }
+                    } else {
+                        // Preserve the original behavior for one stream or more than two
+                        // streams: one window per stream.
+                        std::string window_name = "YOLO26 Detection - Stream " + std::to_string(stream_idx);
+                        cv::imshow(window_name, display_image);
+                    }
+
+                    // Handle keyboard input for fullscreen toggle
+                    int key = cv::waitKey(1);
+                    if (key == 'f' || key == 'F') {
+                        // Toggle fullscreen
+                        is_fullscreen = !is_fullscreen;
+                        std::string target_window = (num_streams_global == 2) ? 
+                            "YOLO26 Detection" : 
+                            "YOLO26 Detection - Stream " + std::to_string(stream_idx);
+                        
+                        if (is_fullscreen) {
+                            cv::setWindowProperty(target_window, cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
+                        } else {
+                            cv::setWindowProperty(target_window, cv::WND_PROP_FULLSCREEN, cv::WINDOW_NORMAL);
+                        }
+                    } else if (key == 27) {  // ESC key
+                        // Exit fullscreen if in fullscreen mode
+                        if (is_fullscreen) {
+                            is_fullscreen = false;
+                            std::string target_window = (num_streams_global == 2) ? 
+                                "YOLO26 Detection" : 
+                                "YOLO26 Detection - Stream " + std::to_string(stream_idx);
+                            cv::setWindowProperty(target_window, cv::WND_PROP_FULLSCREEN, cv::WINDOW_NORMAL);
+                        }
+                    }
                 } catch (const cv::Exception& e) {
                     std::cerr << "OpenCV display error (continuing): " << e.what() << std::endl;
                     is_show = false;  // Disable further display attempts
@@ -330,7 +400,9 @@ int main(int argc, char* argv[]) {
     if(num_streams == 0){
         video_src_list.push_back(video_str);
         num_streams = 1;
-    }  
+    }
+    num_streams_global = num_streams;
+    latest_display_frames.assign(num_streams_global, cv::Mat());
 
     std::cout << "\n=== Configuration ===" << std::endl;
     std::cout << "Model path: " << model_path << std::endl;
@@ -368,6 +440,20 @@ int main(int argc, char* argv[]) {
             // Clean up any created apps
             for (auto* a : apps) delete a;
             return 1;
+        }
+    }
+
+    // Create OpenCV windows with resizable/fullscreen capability
+    if (is_show_global) {
+        if (num_streams == 2) {
+            cv::namedWindow("YOLO26 Detection", cv::WINDOW_NORMAL);
+            std::cout << "Created resizable window 'YOLO26 Detection' (press 'f' for fullscreen, ESC to exit fullscreen)" << std::endl;
+        } else {
+            for (int i = 0; i < num_streams; ++i) {
+                std::string window_name = "YOLO26 Detection - Stream " + std::to_string(i);
+                cv::namedWindow(window_name, cv::WINDOW_NORMAL);
+            }
+            std::cout << "Created resizable window(s) (press 'f' for fullscreen, ESC to exit fullscreen)" << std::endl;
         }
     }
 

@@ -10,26 +10,37 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 #include "memx/accl/MxAccl.h"
 #include "yolo26.h"
 
 namespace fs = std::filesystem;
 
+// ── Canvas dimensions ────────────────────────────────────────────────────────
+static constexpr int DISP_W = 1280;
+static constexpr int DISP_H = 720;
+static constexpr int HALF_W = DISP_W / 2;
+static constexpr int HALF_H = DISP_H / 2;
+
 std::atomic_bool runflag;  // Atomic flag to control run state
 bool is_show_global = true;  // Global flag to indicate if any stream should show display - ALWAYS TRUE
 int num_streams_global = 2;  // Total number of configured streams - ALWAYS 2
-std::mutex display_mutex;  // Protect shared OpenCV display state
 
-// Quadrant window configuration
-int screen_width = 0;
-int screen_height = 0;
-int quadrant_width = 0;
-int quadrant_height = 0;
-cv::Mat logo_image;
-cv::Mat modules_image;
+// ── Display globals (double-buffering with dedicated display thread) ─────────
+cv::Mat           g_canvas[2];
+std::atomic<int>  g_back_idx{0};
+std::mutex        g_roi_mutex[2];        // per-stream, guards ROI write into back canvas
+std::mutex        g_disp_mutex;
+std::condition_variable g_disp_cv;
+std::atomic<bool> g_frame_ready{false};
+std::atomic<bool> is_fullscreen{false};
 
-// Yolo26 application specific parameters - HARDCODED FOR SILLY GOOSE MODE
+// Image paths for static tiles
+std::string logo_image_path;
+std::string modules_image_path;
+
+// Yolo26 application specific parameters
 fs::path model_path = "YOLO26_nano_640_640_3_onnx.dfp";  // Hardcoded DFP path
 std::string video_str = "cam:0,cam:2";  // Hardcoded dual camera setup
 
@@ -39,6 +50,98 @@ std::string video_str = "cam:0,cam:2";  // Hardcoded dual camera setup
 // Signal handler to gracefully stop the program on SIGINT (Ctrl+C)
 void signal_handler(int p_signal) {
     runflag.store(false);  // Stop the program
+    g_disp_cv.notify_all();
+}
+
+// ── Helper: Paint static tiles ───────────────────────────────────────────────
+void paint_static_tiles(cv::Mat& canvas,
+                        const std::string& logo_path,
+                        const std::string& modules_path)
+{
+    auto paint = [](cv::Mat& roi, const std::string& path, const std::string& label) {
+        if (!path.empty()) {
+            cv::Mat img = cv::imread(path);
+            if (!img.empty()) {
+                double scale = std::min((double)roi.cols / img.cols,
+                                        (double)roi.rows / img.rows);
+                int nw = (int)(img.cols * scale);
+                int nh = (int)(img.rows * scale);
+                cv::Mat sub = roi(cv::Rect((roi.cols - nw) / 2, (roi.rows - nh) / 2, nw, nh));
+                cv::resize(img, sub, cv::Size(nw, nh), 0, 0, cv::INTER_AREA);
+                return;
+            }
+        }
+        // Fallback: dark background with label
+        roi.setTo(cv::Scalar(30, 30, 30));
+        cv::putText(roi, label, cv::Point(roi.cols / 2 - 60, roi.rows / 2),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
+    };
+
+    cv::Mat tl = canvas(cv::Rect(0,      0,      HALF_W, HALF_H));
+    cv::Mat br = canvas(cv::Rect(HALF_W, HALF_H, HALF_W, HALF_H));
+    paint(tl, logo_path,    "Logos");
+    paint(br, modules_path, "Modules");
+
+    cv::line(canvas, cv::Point(HALF_W, 0),      cv::Point(HALF_W, DISP_H), cv::Scalar(200, 200, 200), 2);
+    cv::line(canvas, cv::Point(0,      HALF_H), cv::Point(DISP_W, HALF_H), cv::Scalar(200, 200, 200), 2);
+}
+
+// ── Dedicated display thread ─────────────────────────────────────────────────
+// All HighGUI calls live here so GTK sees them on one consistent thread.
+void display_thread_func() {
+    cv::namedWindow("YOLO26 Detection", cv::WINDOW_NORMAL);
+    cv::resizeWindow("YOLO26 Detection", DISP_W, DISP_H);
+
+    // Pre-paint static tiles now that the window (and GTK context) is owned by this thread.
+    for (int i = 0; i < 2; i++)
+        paint_static_tiles(g_canvas[i], logo_image_path, modules_image_path);
+
+    using clock = std::chrono::steady_clock;
+    const std::chrono::milliseconds frame_interval{33}; // ~30 fps display rate
+    auto next_display = clock::now();
+
+    while (runflag.load()) {
+        {
+            std::unique_lock<std::mutex> lk(g_disp_mutex);
+            g_disp_cv.wait_for(lk, frame_interval, [] {
+                return g_frame_ready.load() || !runflag.load();
+            });
+            g_frame_ready.store(false, std::memory_order_relaxed);
+        }
+
+        if (!runflag.load())
+            break;
+
+        // Rate-limit to ~30fps: if we displayed too recently, just pump GTK events and loop.
+        // This drains burst notifications from two streams without swapping on every one.
+        auto now = clock::now();
+        if (now < next_display) {
+            cv::waitKey(1);
+            continue;
+        }
+        next_display = now + frame_interval;
+
+        // Swap back→front, drain in-flight ROI writes, then present.
+        int front = g_back_idx.load();
+        g_back_idx.store(1 - front, std::memory_order_release);
+
+        {
+            std::lock_guard<std::mutex> lk0(g_roi_mutex[0]);
+            std::lock_guard<std::mutex> lk1(g_roi_mutex[1]);
+            cv::imshow("YOLO26 Detection", g_canvas[front]);
+        }
+
+        int key = cv::waitKey(1);
+        if (key == 'f' || key == 'F') {
+            bool fs = !is_fullscreen.load();
+            is_fullscreen.store(fs);
+            cv::setWindowProperty("YOLO26 Detection", cv::WND_PROP_FULLSCREEN,
+                fs ? cv::WINDOW_FULLSCREEN : cv::WINDOW_NORMAL);
+        } else if (key == 'q' || key == 'Q' || key == 27) {
+            runflag.store(false);
+        }
+    }
+    cv::destroyAllWindows();
 }
 
 // Function to configure camera settings (resolution and FPS)
@@ -163,7 +266,7 @@ class YoloApp {
             yolo26->postprocess(mxa_output, result);
             yolo26->draw_result(result, display_image);
 
-            // Display the updated image using OpenCV
+            // Display the updated image using dedicated display thread
             if (is_show) {
                 try {
                     // Add FPS/stream text to the display (truncated to integer)
@@ -172,21 +275,16 @@ class YoloApp {
                     cv::putText(display_image, fps_text, cv::Point(10, 30),
                                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
 
-                    std::lock_guard<std::mutex> dlock(display_mutex);
-
-                    // Display each stream in its own quadrant window
-                    std::string window_name = (stream_idx == 0) ? "Stream 0 - Camera 0" : "Stream 1 - Camera 2";
-                    
-                    // Resize to fit quadrant and display
-                    cv::Mat resized_display;
-                    cv::resize(display_image, resized_display, cv::Size(quadrant_width, quadrant_height));
-                    cv::imshow(window_name, resized_display);
-
-                    // Handle keyboard input
-                    int key = cv::waitKey(1);
-                    if (key == 27 || key == 'q' || key == 'Q') {  // ESC or Q key to quit
-                        runflag.store(false);
+                    // Write directly into back canvas ROI — no separate windows
+                    int back = g_back_idx.load(std::memory_order_relaxed);
+                    cv::Mat roi = g_canvas[back](
+                        cv::Rect(stream_idx == 0 ? 0 : HALF_W, stream_idx == 0 ? HALF_H : 0, HALF_W, HALF_H));
+                    {
+                        std::lock_guard<std::mutex> lk(g_roi_mutex[stream_idx]);
+                        cv::resize(display_image, roi, cv::Size(HALF_W, HALF_H), 0, 0, cv::INTER_LINEAR);
                     }
+                    g_frame_ready.store(true, std::memory_order_release);
+                    g_disp_cv.notify_one();
                 } catch (const cv::Exception& e) {
                     std::cerr << "OpenCV display error (continuing): " << e.what() << std::endl;
                     is_show = false;  // Disable further display attempts
@@ -290,29 +388,18 @@ class YoloApp {
 };
 
 int main(int argc, char* argv[]) {
-    std::cout << "YOLO26 Silly Goose Quadrant Mode Starting..." << std::endl;
+    std::cout << "YOLO26 Detection Application Starting..." << std::endl;
     
     try {
         signal(SIGINT, signal_handler);  // Set up signal handler
         
-        // HARDCODED CONFIGURATION - SILLY GOOSE MODE!
+        // Hardcoded configuration
         std::vector<std::string> video_src_list = {"cam:0", "cam:2"};
         int num_streams = 2;
         num_streams_global = num_streams;
         
-        // Hardcoded screen resolution for embedded platform
-        // To change: edit these two lines
-        screen_width = 1920;
-        screen_height = 1080;
-        
-        // Calculate quadrant dimensions
-        quadrant_width = screen_width / 2;   // Should be 960
-        quadrant_height = screen_height / 2; // Should be 540
-        
-        std::cout << "Screen Resolution: " << screen_width << "x" << screen_height << std::endl;
-        std::cout << "Quadrant Size: " << quadrant_width << "x" << quadrant_height << std::endl;
-        std::cout << "  Width: " << quadrant_width << " (should be WIDER)" << std::endl;
-        std::cout << "  Height: " << quadrant_height << " (should be SHORTER)" << std::endl;
+        std::cout << "Display Canvas: " << DISP_W << "x" << DISP_H << std::endl;
+        std::cout << "Quadrant Size: " << HALF_W << "x" << HALF_H << std::endl;
         
         // Get current working directory for debugging
         fs::path cwd = fs::current_path();
@@ -329,26 +416,21 @@ int main(int argc, char* argv[]) {
             cwd / ".." / "combined_logos.png"
         };
         
-        // Load logo image
-        logo_image = cv::Mat();
+        // Find logo image path
         for (const auto& path : search_paths) {
             std::cout << "Trying to load logo from: " << path << std::endl;
             if (fs::exists(path)) {
-                logo_image = cv::imread(path.string());
-                if (!logo_image.empty()) {
-                    std::cout << "Successfully loaded logo from: " << path << std::endl;
+                cv::Mat test = cv::imread(path.string());
+                if (!test.empty()) {
+                    logo_image_path = path.string();
+                    std::cout << "Successfully found logo at: " << path << std::endl;
                     break;
                 }
             }
         }
         
-        if (logo_image.empty()) {
-            std::cerr << "Warning: Could not load combined_logos.png from any location, using placeholder" << std::endl;
-            logo_image = cv::Mat(quadrant_height, quadrant_width, CV_8UC3, cv::Scalar(50, 50, 50));
-            cv::putText(logo_image, "combined_logos.png", cv::Point(50, quadrant_height/2),
-                       cv::FONT_HERSHEY_SIMPLEX, 2.0, cv::Scalar(255, 255, 255), 3);
-        } else {
-            cv::resize(logo_image, logo_image, cv::Size(quadrant_width, quadrant_height));
+        if (logo_image_path.empty()) {
+            std::cerr << "Warning: Could not load combined_logos.png from any location" << std::endl;
         }
         
         // Try multiple locations for modules image
@@ -358,36 +440,31 @@ int main(int argc, char* argv[]) {
             cwd / ".." / "combined_modules.png"
         };
         
-        // Load modules image
-        modules_image = cv::Mat();
+        // Find modules image path
         for (const auto& path : search_paths_modules) {
             std::cout << "Trying to load modules from: " << path << std::endl;
             if (fs::exists(path)) {
-                modules_image = cv::imread(path.string());
-                if (!modules_image.empty()) {
-                    std::cout << "Successfully loaded modules from: " << path << std::endl;
+                cv::Mat test = cv::imread(path.string());
+                if (!test.empty()) {
+                    modules_image_path = path.string();
+                    std::cout << "Successfully found modules at: " << path << std::endl;
                     break;
                 }
             }
         }
         
-        if (modules_image.empty()) {
-            std::cerr << "Warning: Could not load combined_modules.png from any location, using placeholder" << std::endl;
-            modules_image = cv::Mat(quadrant_height, quadrant_width, CV_8UC3, cv::Scalar(70, 70, 70));
-            cv::putText(modules_image, "combined_modules.png", cv::Point(50, quadrant_height/2),
-                       cv::FONT_HERSHEY_SIMPLEX, 2.0, cv::Scalar(255, 255, 255), 3);
-        } else {
-            cv::resize(modules_image, modules_image, cv::Size(quadrant_width, quadrant_height));
+        if (modules_image_path.empty()) {
+            std::cerr << "Warning: Could not load combined_modules.png from any location" << std::endl;
         }
 
-        std::cout << "\n=== SILLY GOOSE QUADRANT CONFIGURATION ===" << std::endl;
-        std::cout << "Model path: " << model_path << " (HARDCODED)" << std::endl;
-        std::cout << "Number of streams: " << num_streams << " (HARDCODED)" << std::endl;
-        std::cout << "Display enabled: YES (ALWAYS)" << std::endl;
+        std::cout << "\n=== CONFIGURATION ===" << std::endl;
+        std::cout << "Model path: " << model_path << std::endl;
+        std::cout << "Number of streams: " << num_streams << std::endl;
+        std::cout << "Display enabled: YES" << std::endl;
         for (int i = 0; i < num_streams; ++i) {
             std::cout << "  Stream " << i << ": " << video_src_list[i] << std::endl;
         }
-        std::cout << "==========================================\n" << std::endl;
+        std::cout << "=====================" << std::endl;
 
     std::cout << "Initializing MemryX Accelerator..." << std::endl;
     
@@ -403,6 +480,16 @@ int main(int argc, char* argv[]) {
         std::cout << "Display enabled (--show flag set)" << std::endl;
     }
 
+    // Pre-allocate canvases (tiles are painted inside display_thread_func after window creation)
+    for (int i = 0; i < 2; i++)
+        g_canvas[i] = cv::Mat(DISP_H, DISP_W, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    // Start display thread — owns all HighGUI calls to satisfy GTK's single-thread requirement
+    std::thread disp_thread(display_thread_func);
+    
+    // Give display thread a moment to create window
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
     // Creating YoloApp objects for each video stream
     std::vector<YoloApp*> apps;
     for (int i = 0; i < num_streams; ++i) {
@@ -415,57 +502,12 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error creating stream " << i << ": " << e.what() << std::endl;
             // Clean up any created apps
             for (auto* a : apps) delete a;
+            runflag.store(false);
+            g_disp_cv.notify_all();
+            disp_thread.join();
             return 1;
         }
     }
-
-    // Create OpenCV windows positioned at each quadrant
-    std::cout << "Creating quadrant windows..." << std::endl;
-    
-    // Create windows with AUTOSIZE (no manual resizing, minimal decorations)
-    cv::namedWindow("Stream 0 - Camera 0", cv::WINDOW_AUTOSIZE);
-    cv::namedWindow("Stream 1 - Camera 2", cv::WINDOW_AUTOSIZE);
-    cv::namedWindow("Logos", cv::WINDOW_AUTOSIZE);
-    cv::namedWindow("Modules", cv::WINDOW_AUTOSIZE);
-    
-    // Try to remove window decorations (may not work on all window managers)
-    cv::setWindowProperty("Stream 0 - Camera 0", cv::WND_PROP_TOPMOST, 1);
-    cv::setWindowProperty("Stream 1 - Camera 2", cv::WND_PROP_TOPMOST, 1);
-    cv::setWindowProperty("Logos", cv::WND_PROP_TOPMOST, 1);
-    cv::setWindowProperty("Modules", cv::WND_PROP_TOPMOST, 1);
-    
-    // Note: With AUTOSIZE, windows will size to match image content automatically
-    // No need to call cv::resizeWindow()
-    
-    // Wait a moment for window manager to process
-    cv::waitKey(50);
-    
-    // Position windows at each quadrant
-    // Top-left: Stream 0
-    cv::moveWindow("Stream 0 - Camera 0", 0, 0);
-    
-    // Top-right: Stream 1  
-    cv::moveWindow("Stream 1 - Camera 2", quadrant_width, 0);
-    
-    // Bottom-left: Logos
-    cv::moveWindow("Logos", 0, quadrant_height);
-    
-    // Bottom-right: Modules
-    cv::moveWindow("Modules", quadrant_width, quadrant_height);
-    
-    // Final wait to let window manager settle
-    cv::waitKey(50);
-    
-    std::cout << "Quadrant windows created and positioned!" << std::endl;
-    std::cout << "  Stream 0 at (0, 0) - size " << quadrant_width << "x" << quadrant_height << std::endl;
-    std::cout << "  Stream 1 at (" << quadrant_width << ", 0) - size " << quadrant_width << "x" << quadrant_height << std::endl;
-    std::cout << "  Logos at (0, " << quadrant_height << ") - size " << quadrant_width << "x" << quadrant_height << std::endl;
-    std::cout << "  Modules at (" << quadrant_width << ", " << quadrant_height << ") - size " << quadrant_width << "x" << quadrant_height << std::endl;
-    
-    // Display static images once - they'll stay visible until program exits
-    cv::imshow("Logos", logo_image);
-    cv::imshow("Modules", modules_image);
-    cv::waitKey(1);  // Process window events once
 
     std::cout << "Starting accelerator..." << std::endl;
     
@@ -476,12 +518,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Accelerator stopped." << std::endl;
     
-    // Cleanup OpenCV windows
-    try {
-        cv::destroyAllWindows();
-    } catch (...) {
-        // Ignore cleanup errors
-    }
+    // Stop display thread
+    runflag.store(false);
+    g_disp_cv.notify_all();
+    disp_thread.join();
 
     // Print out final avg FPS
     float final_fps = 0.f;
@@ -496,7 +536,7 @@ int main(int argc, char* argv[]) {
         delete apps[i];
     }
     
-    std::cout << "\n🦆 Silly Goose Quadrant Mode finished successfully! 🦆" << std::endl;
+    std::cout << "\nYOLO26 Detection Application finished successfully." << std::endl;
     return 0;
     
     } catch (const std::exception& e) {

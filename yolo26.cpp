@@ -190,8 +190,8 @@ void YOLO26::_draw_bbox(cv::Mat &image, int x_min, int y_min, int x_max,
 
 YOLO26::YOLO26()
 {
-    model_input_width_ = 640;
-    model_input_height_ = 640;
+    model_input_width_ = 320;
+    model_input_height_ = 320;
     model_input_channel_ = 3;
     confidence_thresh_ = 0.3f;
     confidence_thresh_fastSigmoid_ = _conf_to_fastSigmoid_inputVal(confidence_thresh_);
@@ -215,8 +215,8 @@ YOLO26::YOLO26()
         {
             .coordinate_ofmap_flow_id = 0,
             .confidence_ofmap_flow_id = 1,
-            .width = model_input_width_ / 8,   // L0_HW, 640 / 8 = 80
-            .height = model_input_height_ / 8, // L0_HW, 640 / 8 = 80
+            .width = model_input_width_ / 8,   // L0_HW, 320 / 8 = 40
+            .height = model_input_height_ / 8, // L0_HW, 320 / 8 = 40
             .ratio = 8,
             .coordinate_fmap_size = 4,  // YOLO26: 4 bbox values instead of 64
         };
@@ -225,8 +225,8 @@ YOLO26::YOLO26()
         {
             .coordinate_ofmap_flow_id = 2,
             .confidence_ofmap_flow_id = 3,
-            .width = model_input_width_ / 16,   // L1_HW, 640 / 16 = 40
-            .height = model_input_height_ / 16, // L1_HW, 640 / 16 = 40
+            .width = model_input_width_ / 16,   // L1_HW, 320 / 16 = 20
+            .height = model_input_height_ / 16, // L1_HW, 320 / 16 = 20
             .ratio = 16,
             .coordinate_fmap_size = 4,  // YOLO26: 4 bbox values instead of 64
         };
@@ -235,8 +235,8 @@ YOLO26::YOLO26()
         {
             .coordinate_ofmap_flow_id = 4,
             .confidence_ofmap_flow_id = 5,
-            .width = model_input_width_ / 32,   // L2_HW, 640 / 32 = 20
-            .height = model_input_height_ / 32, // L2_HW, 640 / 32 = 20
+            .width = model_input_width_ / 32,   // L2_HW, 320 / 32 = 10
+            .height = model_input_height_ / 32, // L2_HW, 320 / 32 = 10
             .ratio = 32,
             .coordinate_fmap_size = 4,  // YOLO26: 4 bbox values instead of 64
         };

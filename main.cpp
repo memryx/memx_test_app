@@ -19,7 +19,7 @@ namespace fs = std::filesystem;
 
 // ── Canvas dimensions ────────────────────────────────────────────────────────
 static constexpr int DISP_W = 1280;
-static constexpr int DISP_H = 720;
+static constexpr int DISP_H = 800;
 static constexpr int HALF_W = DISP_W / 2;
 static constexpr int HALF_H = DISP_H / 2;
 
@@ -41,7 +41,7 @@ std::string logo_image_path;
 std::string modules_image_path;
 
 // Yolo26 application specific parameters
-fs::path model_path = "YOLO26_nano_640_640_3_onnx.dfp";  // Hardcoded DFP path
+fs::path model_path = "YOLO26_nano_320_320_3_onnx.dfp";  // 320x320 model to reduce DMA load
 std::string video_str = "cam:0,cam:2";  // Hardcoded dual camera setup
 
 #define FPS_LOG_INTERVAL 30  // print out FPS every X frames
@@ -62,6 +62,9 @@ void paint_static_tiles(cv::Mat& canvas,
         if (!path.empty()) {
             cv::Mat img = cv::imread(path);
             if (!img.empty()) {
+                // Fill background with white padding
+                roi.setTo(cv::Scalar(255, 255, 255));
+                
                 double scale = std::min((double)roi.cols / img.cols,
                                         (double)roi.rows / img.rows);
                 int nw = (int)(img.cols * scale);
@@ -100,20 +103,28 @@ void display_thread_func() {
     const std::chrono::milliseconds frame_interval{33}; // ~30 fps display rate
     auto next_display = clock::now();
 
+    bool had_new_frame = false;
     while (runflag.load()) {
         {
             std::unique_lock<std::mutex> lk(g_disp_mutex);
-            g_disp_cv.wait_for(lk, frame_interval, [] {
+            had_new_frame = g_disp_cv.wait_for(lk, frame_interval, [] {
                 return g_frame_ready.load() || !runflag.load();
             });
-            g_frame_ready.store(false, std::memory_order_relaxed);
+            if (had_new_frame) {
+                g_frame_ready.store(false, std::memory_order_relaxed);
+            }
         }
 
         if (!runflag.load())
             break;
 
+        // Only swap buffers if we actually got a new frame
+        if (!had_new_frame) {
+            cv::waitKey(1);  // Just pump GTK events, don't swap
+            continue;
+        }
+
         // Rate-limit to ~30fps: if we displayed too recently, just pump GTK events and loop.
-        // This drains burst notifications from two streams without swapping on every one.
         auto now = clock::now();
         if (now < next_display) {
             cv::waitKey(1);
@@ -148,6 +159,9 @@ void display_thread_func() {
 bool configure_camera(cv::VideoCapture& vcap) {
     bool settings_success = true;
     try {
+        // Force MJPEG format to avoid YUYV bandwidth issues
+        vcap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
+        
         // Attempt to set 640x480 resolution and 30 FPS
         if (!vcap.set(cv::CAP_PROP_FRAME_HEIGHT, 480) || 
             !vcap.set(cv::CAP_PROP_FRAME_WIDTH, 640) || 
@@ -167,11 +181,21 @@ bool configure_camera(cv::VideoCapture& vcap) {
 
 // Function to open the camera and apply settings, if not possible, reopen with default settings
 bool open_camera(cv::VideoCapture& vcap, int device, int api) {
+    std::cout << "Opening camera device " << device << " with API backend: " << api << " (V4L2=" << cv::CAP_V4L2 << ")" << std::endl;
     vcap.open(device, api);  // Open the camera
     if (!vcap.isOpened()) {
         std::cerr << "Failed to open vcap\n";
         return false;
     }
+    
+    // Try to set V4L2 buffer count to reduce blocking (V4L2 specific)
+    // DISABLED - caused FPS to drop to 15 per stream
+    // vcap.set(cv::CAP_PROP_BUFFERSIZE, 1);  // Minimize buffering
+    // std::cout << "Set buffer size to 1 for device " << device << std::endl;
+    
+    // Set read timeout to prevent infinite blocking (V4L2 backend)
+    bool timeout_set = vcap.set(cv::CAP_PROP_READ_TIMEOUT_MSEC, 5000);  // 5 second timeout
+    std::cout << "Attempted to set read timeout to 5000ms for device " << device << ", success=" << timeout_set << std::endl;
 
     if (!configure_camera(vcap)) {  // Try applying custom settings
         vcap.release();  // Release and reopen with default settings
@@ -215,15 +239,18 @@ class YoloApp {
                 cv::Mat inframe;
 
                 while(true){
+                    // std::cout << "Stream " << stream_idx << " - Attempting vcap.read()..." << std::endl;
                     bool got_frame = vcap.read(inframe);  // Capture frame
+                    // std::cout << "Stream " << stream_idx << " - vcap.read() completed, got_frame=" << got_frame << std::endl;
 
                     if (!got_frame) {  // If no frame, stop the stream
-                        std::cout << "No frame \n\n\n";
+                        std::cout << "Stream " << stream_idx << " - vcap.read() RETURNED FALSE - Camera/video capture failed!" << std::endl;
                         vcap.release();
                         return false;
                     }
 
                     if(src_is_cam && (frames_queue.size() >= FRAME_QUEUE_MAX_LENGTH)){
+                        // std::cout << "Stream " << stream_idx << " - DROPPING FRAME - Queue full (size: " << frames_queue.size() << ")" << std::endl;
                         // drop the frame and try again if we've hit the limit
                         continue;
                     }
@@ -232,6 +259,7 @@ class YoloApp {
                         {
                             std::lock_guard<std::mutex> ilock(frame_queue_mutex);
                             frames_queue.push_back(inframe);
+                            // std::cout << "Stream " << stream_idx << " - PUSHING to frames_queue, size after push: " << frames_queue.size() << std::endl;
                         }
                     }
 
@@ -259,6 +287,7 @@ class YoloApp {
                 std::lock_guard<std::mutex> ilock(frame_queue_mutex);
                 display_image = frames_queue.front();
                 frames_queue.pop_front();
+                // std::cout << "Stream " << stream_idx << " - POPPING from frames_queue, size after pop: " << frames_queue.size() << std::endl;
             }
             
             // Set confidence threshold and process detection results
@@ -321,11 +350,21 @@ class YoloApp {
         // Constructor to initialize YOLO26 object
         YoloApp(MX::Runtime::MxAccl* accl_, std::string video_src, int stream_idx) {
             is_show = is_show_global;  // Initialize per-stream flag from global
+            
+            // Stagger camera initialization to reduce DMA contention (16.67ms per stream)
+            if (stream_idx > 0) {
+                int stagger_ms = stream_idx * 17;  // ~16.67ms per stream
+                std::cout << "Stream " << stream_idx << " staggering start by " << stagger_ms << "ms" << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(stagger_ms));
+            }
+            
             // Open the camera or video source
             if(video_src.substr(0,3) == "cam") {
                 src_is_cam = true;
                 int device = std::stoi(video_src.substr(4));
+                std::cout << "Stream " << stream_idx << " opening camera device " << device << std::endl;
                 #ifdef __linux__
+                    std::cout << "Stream " << stream_idx << " using V4L2 backend" << std::endl;
                     if (!open_camera(vcap, device, cv::CAP_V4L2)) {
                         throw(std::runtime_error("Failed to open: "+video_src));
                     }
@@ -334,6 +373,7 @@ class YoloApp {
                         throw(std::runtime_error("Failed to open: "+video_src));
                     }
                 #endif
+                std::cout << "Stream " << stream_idx << " camera opened successfully" << std::endl;
             } else if (video_src.substr(0,3) == "vid") {
                 src_is_cam = false;
                 std::cout << "Video source given = " << video_src.substr(4) << "\n\n";
@@ -473,7 +513,6 @@ int main(int argc, char* argv[]) {
     std::array<bool, 2> use_model_shape = {false, false};
     bool local_mode = true;
     MX::Runtime::MxAccl accl{fs::path(model_path), device_ids, use_model_shape, local_mode};
-    accl.set_num_workers(1, 3, 0);
 
     std::cout << "Accelerator initialized. Creating " << num_streams << " stream(s)..." << std::endl;
     if (is_show_global) {
